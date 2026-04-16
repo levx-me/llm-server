@@ -1,10 +1,11 @@
 # llm-server
 
-Self-hosted LLM stack: Ollama + Open WebUI + LiteLLM proxy behind Caddy.
+Self-hosted LLM stack: **Ollama + Open WebUI + LiteLLM** behind **Caddy**.
+Same `docker compose` works on AWS, RunPod, or bare metal.
 
 ## Stack
 
-| Service | Port (container) | Role |
+| Service | Container port | Role |
 |---|---|---|
 | ollama | 11434 | LLM inference (GPU) |
 | open-webui | 8080 | Chat UI |
@@ -23,50 +24,70 @@ Self-hosted LLM stack: Ollama + Open WebUI + LiteLLM proxy behind Caddy.
 ## Prerequisites
 
 - Docker + Docker Compose
-- NVIDIA Container Toolkit (`nvidia-container-toolkit`) for GPU
-- GPU-enabled host with recent NVIDIA driver
+- NVIDIA Container Toolkit for GPU
+- NVIDIA driver on host
 
-## Setup
+## Quick start
 
 ```bash
 cp .env.example .env
-# edit .env: set LITELLM_MASTER_KEY, SITE_ADDRESS, MODELS
+# edit .env: LITELLM_MASTER_KEY, SITE_ADDRESS, MODELS, DATA_ROOT
 
 docker compose up -d
+docker compose logs -f model-init   # watch model downloads
 ```
 
-First boot will pull the Ollama models listed in `MODELS` (default: `gemma4:e4b`). Watch progress:
+## Platform notes
 
-```bash
-docker compose logs -f model-init
+### AWS EC2 (or any bare metal with public IP + domain)
+
+```env
+DATA_ROOT=./data
+SITE_ADDRESS=llm.example.com
+CADDY_HTTP_PORT=80
+CADDY_HTTPS_PORT=443
 ```
+
+- Point DNS `A` record at the EC2 public IP
+- Open security group ports 80 + 443
+- Caddy auto-issues a Let's Encrypt cert (no manual TLS work)
+- Install `nvidia-container-toolkit` first: see https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+
+### RunPod (GPU pod)
+
+```env
+DATA_ROOT=/runpod-volume
+SITE_ADDRESS=:80
+CADDY_HTTP_PORT=80
+```
+
+1. Create a **Network Volume** in RunPod (persists across pod rebuilds)
+2. Launch a GPU pod with the volume mounted at `/runpod-volume`
+3. In the pod template, expose HTTP port `80`
+4. SSH into the pod:
+   ```bash
+   git clone <this repo>
+   cd llm-server
+   cp .env.example .env   # edit as above
+   docker compose up -d
+   ```
+5. Access at `https://{pod-id}-80.proxy.runpod.net` (RunPod terminates TLS)
+
+> RunPod proxy handles HTTPS — Caddy only needs to serve plain HTTP. Set
+> `SITE_ADDRESS=:80`. If you want your own domain with TCP public IP instead
+> of the proxy, use `SITE_ADDRESS=llm.example.com` like the AWS case.
 
 ## Configuration
 
-- **Models** — edit `configs/litellm-config.yaml` to add/alias models
+- **Models** — edit `configs/litellm-config.yaml` to add / alias models
 - **Routing** — edit `configs/Caddyfile`
 - **Pre-pulled models** — set `MODELS="gemma4:e4b qwen3.5:9b ..."` in `.env`
 
-Restart the affected service after config changes:
+Restart after config changes:
 
 ```bash
 docker compose restart litellm    # after litellm-config.yaml change
 docker compose restart caddy      # after Caddyfile change
-```
-
-## Public HTTPS (AWS / bare metal with real domain)
-
-Set in `.env`:
-```
-SITE_ADDRESS=llm.example.com
-```
-
-Caddy auto-issues a Let's Encrypt cert. DNS A record must point to the host and ports 80/443 must be open.
-
-## HTTP only (local / behind another proxy)
-
-```
-SITE_ADDRESS=:80
 ```
 
 ## Usage
@@ -96,11 +117,18 @@ docker compose ps
 docker compose logs -f <service>
 docker compose restart <service>
 docker compose down        # stop all
-docker compose down -v     # stop all + drop volumes (wipes models + webui data)
+docker compose down -v     # stop + drop named volumes (DATA_ROOT bind mounts stay)
 ```
 
-## Data locations (volumes)
+## Data layout (under `DATA_ROOT`)
 
-- `ollama_data` — pulled models (~GB per model)
-- `openwebui_data` — Open WebUI users, chats, uploads
-- `caddy_data`, `caddy_config` — TLS certs and runtime state
+```
+${DATA_ROOT}/
+├── ollama/        # pulled models (GB)
+├── openwebui/     # Open WebUI users, chats, uploads
+└── caddy/
+    ├── data/      # Let's Encrypt certs, state
+    └── config/    # runtime config
+```
+
+Back up the whole `DATA_ROOT` to preserve everything.

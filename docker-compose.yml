@@ -1,29 +1,32 @@
 name: llm-server
 
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
 services:
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
     restart: unless-stopped
     volumes:
-      - ollama_data:/root/.ollama
+      - ${DATA_ROOT:-./data}/ollama:/root/.ollama
     environment:
       OLLAMA_HOST: 0.0.0.0:11434
       OLLAMA_KEEP_ALIVE: 24h
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    <<: *gpu
 
   model-init:
     image: ollama/ollama:latest
     depends_on:
       - ollama
     volumes:
-      - ollama_data:/root/.ollama
+      - ${DATA_ROOT:-./data}/ollama:/root/.ollama
     environment:
       OLLAMA_HOST: ollama:11434
       MODELS: ${MODELS:-gemma4:e4b}
@@ -48,7 +51,7 @@ services:
     depends_on:
       - ollama
     volumes:
-      - openwebui_data:/app/backend/data
+      - ${DATA_ROOT:-./data}/openwebui:/app/backend/data
     environment:
       OLLAMA_BASE_URL: http://ollama:11434
       WEBUI_AUTH: ${WEBUI_AUTH:-True}
@@ -79,13 +82,7 @@ services:
       - "${CADDY_HTTPS_PORT:-443}:443"
     volumes:
       - ./configs/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
+      - ${DATA_ROOT:-./data}/caddy/data:/data
+      - ${DATA_ROOT:-./data}/caddy/config:/config
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}
-
-volumes:
-  ollama_data:
-  openwebui_data:
-  caddy_data:
-  caddy_config:
