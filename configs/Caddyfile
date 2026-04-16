@@ -1,0 +1,27 @@
+{
+	admin off
+}
+
+{$SITE_ADDRESS} {
+	@litellm_api path /v1 /v1/* /swagger /swagger/* /openapi.json /ui /ui/* /fallback /fallback/*
+	handle @litellm_api {
+		reverse_proxy litellm:4000
+	}
+
+	handle /anthropic/* {
+		uri strip_prefix /anthropic
+		reverse_proxy litellm:4000
+	}
+
+	@docs_exact path /docs /litellm /litellm/*
+	redir @docs_exact /docs/ 302
+
+	handle /docs/* {
+		uri strip_prefix /docs
+		reverse_proxy litellm:4000
+	}
+
+	handle {
+		reverse_proxy open-webui:8080
+	}
+}
