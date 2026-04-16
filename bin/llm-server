@@ -1,0 +1,588 @@
+#!/usr/bin/env bash
+#
+# llm-server — management CLI for the llm-server stack.
+# https://github.com/levx-me/llm-server
+
+set -euo pipefail
+
+# -------------------------------------------------------------- helpers --
+log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+err() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# -------------------------------------------------------------- LLM_HOME --
+find_llm_home() {
+	if [[ -n "${LLM_HOME:-}" ]]; then
+		echo "$LLM_HOME"
+	elif [[ -f "./docker-compose.yml" && -d "./configs" ]]; then
+		pwd
+	elif [[ -f "$HOME/llm-server/docker-compose.yml" ]]; then
+		echo "$HOME/llm-server"
+	else
+		echo ""
+	fi
+}
+LLM_HOME="$(find_llm_home)"
+
+require_home() {
+	[[ -n "$LLM_HOME" ]] || err "LLM_HOME not found. Set LLM_HOME=/path/to/llm-server or run from the repo."
+}
+
+# -------------------------------------------------------------- docker --
+SUDO_DOCKER=""
+ensure_docker() {
+	command -v docker >/dev/null || err "docker not installed"
+	if ! docker ps >/dev/null 2>&1; then
+		if sudo -n docker ps >/dev/null 2>&1 || sudo docker ps >/dev/null 2>&1; then
+			SUDO_DOCKER="sudo"
+		else
+			err "docker not accessible. Add yourself to 'docker' group and re-login."
+		fi
+	fi
+	$SUDO_DOCKER docker compose version >/dev/null 2>&1 ||
+		err "docker compose v2 plugin missing"
+}
+
+dc() {
+	require_home
+	ensure_docker
+	cd "$LLM_HOME"
+	$SUDO_DOCKER docker compose "$@"
+}
+
+# -------------------------------------------------------------- env io --
+env_get() {
+	require_home
+	[[ -f "$LLM_HOME/.env" ]] || return 1
+	grep "^$1=" "$LLM_HOME/.env" | head -1 | cut -d= -f2-
+}
+
+env_set() {
+	require_home
+	sed -i "s|^$1=.*|$1=$2|" "$LLM_HOME/.env"
+}
+
+gen_key() {
+	if command -v python3 >/dev/null; then
+		printf 'sk-%s' "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+	elif command -v openssl >/dev/null; then
+		printf 'sk-%s' "$(openssl rand -base64 32 | tr -d '=+/' | cut -c1-43)"
+	else
+		err "python3 or openssl required to generate key"
+	fi
+}
+
+# -------------------------------------------------------------- commands --
+cmd_init() {
+	require_home
+	cd "$LLM_HOME"
+
+	if [[ ! -f .env ]]; then
+		[[ -f .env.example ]] || err ".env.example missing in repo"
+		cp .env.example .env
+		env_set LITELLM_MASTER_KEY "$(gen_key)"
+		env_set DATA_ROOT "${DATA_ROOT:-./data}"
+		env_set SITE_ADDRESS "${SITE_ADDRESS:-:80}"
+		log ".env generated"
+	else
+		log ".env exists — leaving untouched"
+	fi
+
+	local data_root
+	data_root="$(env_get DATA_ROOT)"
+	[[ "$data_root" = /* ]] || data_root="$LLM_HOME/${data_root#./}"
+	mkdir -p "$data_root"/{ollama,caddy/data,caddy/config}
+	log "data dirs ready at $data_root"
+}
+
+cmd_up() {
+	dc pull --quiet
+	dc up -d
+	log "stack is up"
+}
+
+cmd_down() {
+	dc down
+}
+
+cmd_restart() {
+	if [[ -n "${1:-}" ]]; then
+		dc restart "$1"
+	else
+		dc restart
+	fi
+}
+
+cmd_status() {
+	dc ps
+	echo
+
+	local site port
+	site="$(env_get SITE_ADDRESS || echo ':80')"
+	port="$(env_get CADDY_HTTP_PORT || echo '80')"
+
+	echo "Endpoints:"
+	if [[ "$site" == :* ]]; then
+		echo "  http://<host>:${port}/v1/models          (OpenAI)"
+		echo "  http://<host>:${port}/anthropic/v1/messages (Anthropic)"
+		echo "  http://<host>:${port}/docs/                (Swagger)"
+		echo "  http://<host>:${port}/ui/                  (Admin UI)"
+	else
+		echo "  https://${site}/v1/models"
+		echo "  https://${site}/anthropic/v1/messages"
+		echo "  https://${site}/docs/"
+		echo "  https://${site}/ui/"
+	fi
+	echo
+	echo "Master key: $(env_get LITELLM_MASTER_KEY)"
+}
+
+cmd_logs() {
+	if [[ -n "${1:-}" ]]; then
+		dc logs -f --tail=200 "$1"
+	else
+		dc logs -f --tail=50
+	fi
+}
+
+cmd_update() {
+	require_home
+	cd "$LLM_HOME"
+	log "pulling latest code"
+	git pull --ff-only --quiet
+	log "pulling latest images"
+	dc pull
+	log "restarting stack"
+	dc up -d
+	log "update complete"
+}
+
+cmd_config() {
+	case "${1:-show}" in
+		show|"")
+			cat "$LLM_HOME/.env"
+			;;
+		edit)
+			"${EDITOR:-vi}" "$LLM_HOME/.env"
+			log "restart affected services with: llm-server restart [service]"
+			;;
+		*)
+			err "usage: llm-server config [show|edit]"
+			;;
+	esac
+}
+
+cmd_key() {
+	case "${1:-show}" in
+		show|"")
+			env_get LITELLM_MASTER_KEY
+			;;
+		rotate)
+			local key
+			key="$(gen_key)"
+			env_set LITELLM_MASTER_KEY "$key"
+			dc up -d --force-recreate litellm >/dev/null
+			log "new key: $key"
+			;;
+		*)
+			err "usage: llm-server key [show|rotate]"
+			;;
+	esac
+}
+
+cmd_models() {
+	case "${1:-list}" in
+		list|"")
+			dc exec ollama ollama list
+			;;
+		pull)
+			[[ -n "${2:-}" ]] || err "usage: llm-server models pull <name>"
+			dc exec ollama ollama pull "$2"
+			;;
+		rm)
+			[[ -n "${2:-}" ]] || err "usage: llm-server models rm <name>"
+			dc exec ollama ollama rm "$2"
+			;;
+		*)
+			err "usage: llm-server models [list|pull <name>|rm <name>]"
+			;;
+	esac
+}
+
+cmd_exec() {
+	[[ -n "${1:-}" ]] || err "usage: llm-server exec <service> [command...]"
+	local service="$1"
+	shift
+	if [[ $# -eq 0 ]]; then
+		dc exec "$service" sh
+	else
+		dc exec "$service" "$@"
+	fi
+}
+
+cmd_test() {
+	local key port
+	key="$(env_get LITELLM_MASTER_KEY)"
+	port="$(env_get CADDY_HTTP_PORT || echo '80')"
+
+	log "GET /v1/models"
+	if curl -fsS "http://localhost:${port}/v1/models" \
+		-H "Authorization: Bearer ${key}" |
+		(command -v python3 >/dev/null && python3 -m json.tool || cat); then
+		log "OK"
+	else
+		err "test failed"
+	fi
+}
+
+cmd_backup() {
+	local data_root target
+	data_root="$(env_get DATA_ROOT)"
+	[[ "$data_root" = /* ]] || data_root="$LLM_HOME/${data_root#./}"
+
+	target="${1:-$LLM_HOME/backup-$(date +%Y%m%d-%H%M%S).tar.gz}"
+
+	log "archiving $data_root -> $target"
+	tar -czf "$target" -C "$(dirname "$data_root")" "$(basename "$data_root")"
+	log "created: $target ($(du -h "$target" | cut -f1))"
+}
+
+cmd_reset() {
+	require_home
+	local data_root
+	data_root="$(env_get DATA_ROOT || echo './data')"
+	[[ "$data_root" = /* ]] || data_root="$LLM_HOME/${data_root#./}"
+
+	echo "WARNING: this will STOP the stack and DELETE $data_root"
+	echo "  - pulled models will be lost"
+	echo "  - Let's Encrypt certs and Caddy state will be lost"
+	echo
+	printf "type 'yes' to confirm: "
+	read -r confirm
+	[[ "$confirm" == "yes" ]] || err "aborted"
+
+	dc down || true
+	rm -rf "$data_root"
+	log "reset complete"
+}
+
+cmd_version() {
+	echo "llm-server CLI"
+	if [[ -n "$LLM_HOME" && -d "$LLM_HOME/.git" ]]; then
+		printf '  repo: %s\n' "$(git -C "$LLM_HOME" log -1 --format='%h — %s (%cr)')"
+	fi
+	if [[ -n "$LLM_HOME" && -f "$LLM_HOME/docker-compose.yml" ]]; then
+		echo "  stack images:"
+		dc config --images 2>/dev/null | sed 's/^/    /'
+	fi
+}
+
+show_main_help() {
+	cat <<'EOF'
+llm-server — management CLI for the self-hosted LLM stack
+             https://github.com/levx-me/llm-server
+
+USAGE
+  llm-server <command> [args...]
+  llm-server help <command>        detailed help for one command
+  llm-server <command> --help      same as above
+
+LIFECYCLE
+  up                    pull images and start the stack in background
+  down                  stop and remove containers (data is preserved)
+  restart [service]     restart all or one service (ollama|litellm|caddy|model-init)
+  status                container status + endpoint URLs + master key
+  logs [service]        tail container logs (follow mode)
+
+CONFIGURATION
+  init                  create .env + data dirs (idempotent; called by installer)
+  config [show|edit]    view or edit .env
+  key [show|rotate]     show or regenerate LITELLM_MASTER_KEY
+
+MODELS
+  models [list]         list installed Ollama models
+  models pull <name>    download a new Ollama model
+  models rm <name>      delete an Ollama model
+
+OPERATIONS
+  update                git pull + docker compose pull + up -d
+  exec <svc> [cmd...]   run a command inside a container (default: sh)
+  test                  hit /v1/models to verify the API end-to-end
+  backup [path]         create a tar.gz of DATA_ROOT
+  reset                 stop and delete DATA_ROOT (confirmation required)
+
+MISC
+  version               CLI + image versions
+  help [command]        this help (or detailed help for one command)
+
+ENVIRONMENT
+  LLM_HOME              install dir (default: $HOME/llm-server or cwd)
+  EDITOR                editor used by 'config edit' (default: vi)
+
+EXAMPLES
+  llm-server status
+  llm-server logs litellm
+  llm-server models pull qwen3.5:27b
+  llm-server exec ollama ollama ps
+  llm-server key rotate
+  llm-server update
+
+EOF
+}
+
+# -------------------------------- per-command help -------------------------
+help_up() { cat <<'EOF'
+llm-server up — start the stack
+
+Pulls the latest images listed in docker-compose.yml and starts all
+services in the background. Idempotent: safe to re-run; containers that
+are already up are reused.
+
+Side effects:
+  - model-init runs once and pulls models in $MODELS (first boot only)
+  - Caddy may request a new Let's Encrypt cert if SITE_ADDRESS is a domain
+
+USAGE
+  llm-server up
+EOF
+}
+
+help_down() { cat <<'EOF'
+llm-server down — stop and remove containers
+
+Stops and removes all containers. Named volumes and DATA_ROOT are left
+intact, so models, certs and master key survive. Use 'reset' to also
+wipe data.
+
+USAGE
+  llm-server down
+EOF
+}
+
+help_restart() { cat <<'EOF'
+llm-server restart [service] — restart all or one service
+
+USAGE
+  llm-server restart               restart every service
+  llm-server restart litellm       restart only litellm
+  llm-server restart caddy         restart only caddy (e.g. after Caddyfile edit)
+EOF
+}
+
+help_status() { cat <<'EOF'
+llm-server status — show stack state
+
+Prints docker compose ps output, followed by the public endpoints derived
+from .env (SITE_ADDRESS, CADDY_HTTP_PORT) and the current LITELLM_MASTER_KEY.
+
+USAGE
+  llm-server status
+  llm-server ps                    alias
+EOF
+}
+
+help_logs() { cat <<'EOF'
+llm-server logs [service] — tail logs in follow mode
+
+USAGE
+  llm-server logs                  last 50 lines of every service, follow
+  llm-server logs litellm          last 200 lines of litellm, follow
+  llm-server logs model-init       watch model downloads
+EOF
+}
+
+help_init() { cat <<'EOF'
+llm-server init — one-time setup
+
+Idempotent setup called by install.sh. You normally don't run this
+manually. It:
+  1. Creates .env from .env.example if missing (generates a random
+     LITELLM_MASTER_KEY, sets DATA_ROOT and SITE_ADDRESS from env).
+  2. Creates DATA_ROOT/{ollama,caddy/data,caddy/config}.
+
+USAGE
+  llm-server init                                  defaults
+  DATA_ROOT=/mnt/ssd llm-server init               override data location
+  SITE_ADDRESS=llm.ex.com llm-server init          enable HTTPS for a domain
+EOF
+}
+
+help_config() { cat <<'EOF'
+llm-server config — view or edit .env
+
+USAGE
+  llm-server config                print .env
+  llm-server config show           same as above
+  llm-server config edit           open .env in $EDITOR
+
+After editing .env, restart the affected services:
+  - LITELLM_MASTER_KEY / MODELS        -> restart litellm (or model-init for MODELS)
+  - SITE_ADDRESS / CADDY_HTTP_PORT     -> restart caddy (and re-pull if port map changed; actually `down && up`)
+  - DATA_ROOT                          -> down && up (bind mount change)
+EOF
+}
+
+help_key() { cat <<'EOF'
+llm-server key — show or rotate LITELLM_MASTER_KEY
+
+USAGE
+  llm-server key                   print the current master key
+  llm-server key show              same
+  llm-server key rotate            generate new key, update .env,
+                                   recreate litellm container, print key
+
+Rotate invalidates all existing clients — they must be updated.
+EOF
+}
+
+help_models() { cat <<'EOF'
+llm-server models — manage Ollama models
+
+USAGE
+  llm-server models                list installed models
+  llm-server models list           same
+  llm-server models pull <name>    download a model (e.g. gemma4:e4b)
+  llm-server models rm <name>      remove a model
+
+NOTES
+  - Pulled models are stored in $DATA_ROOT/ollama and persist across
+    `down && up`.
+  - To pre-pull on first boot, add to MODELS in .env (space separated)
+    and run `llm-server restart model-init`.
+EOF
+}
+
+help_update() { cat <<'EOF'
+llm-server update — upgrade to the latest version
+
+Does three things in order:
+  1. git pull --ff-only              (repo: compose / Caddyfile / CLI)
+  2. docker compose pull             (new image versions)
+  3. docker compose up -d            (recreate changed containers)
+
+Safe to re-run; will no-op if there is nothing new.
+
+USAGE
+  llm-server update
+  llm-server upgrade               alias
+EOF
+}
+
+help_exec() { cat <<'EOF'
+llm-server exec <service> [command...] — run a command in a container
+
+Thin wrapper around `docker compose exec`. Use this for one-off
+investigation that doesn't have its own subcommand.
+
+USAGE
+  llm-server exec ollama                    open a shell
+  llm-server exec ollama ollama ps          see loaded models
+  llm-server exec ollama nvidia-smi         check GPU usage
+  llm-server exec litellm bash              debug litellm
+  llm-server exec caddy caddy reload        reload caddy config without restart
+EOF
+}
+
+help_test() { cat <<'EOF'
+llm-server test — sanity check the API
+
+Calls GET /v1/models on the local Caddy port using LITELLM_MASTER_KEY
+and prints the JSON response. Good post-deploy check.
+
+USAGE
+  llm-server test
+EOF
+}
+
+help_backup() { cat <<'EOF'
+llm-server backup [path] — tar up DATA_ROOT
+
+Creates a gzipped tarball of the entire DATA_ROOT directory. Restore by
+extracting the tarball into the parent of DATA_ROOT while containers are
+down.
+
+USAGE
+  llm-server backup                        writes ./backup-YYYYMMDD-HHMMSS.tar.gz
+  llm-server backup /mnt/backups/llm.tgz   custom path
+EOF
+}
+
+help_reset() { cat <<'EOF'
+llm-server reset — wipe everything (DESTRUCTIVE)
+
+Stops containers and deletes DATA_ROOT entirely. You lose:
+  - all pulled Ollama models (will need to re-download)
+  - Let's Encrypt certs and Caddy state
+  - any files inside DATA_ROOT
+
+Requires typing 'yes' to confirm. Use 'backup' first if in doubt.
+
+USAGE
+  llm-server reset
+EOF
+}
+
+help_version() { cat <<'EOF'
+llm-server version — print CLI + image versions
+
+Shows the current git commit of the repo and the pinned Docker image
+tags from docker-compose.yml.
+
+USAGE
+  llm-server version
+EOF
+}
+
+cmd_help() {
+	local topic="${1:-}"
+	case "$topic" in
+		"")                  show_main_help ;;
+		up)                  help_up ;;
+		down|stop)           help_down ;;
+		restart)             help_restart ;;
+		status|ps)           help_status ;;
+		logs)                help_logs ;;
+		init)                help_init ;;
+		config)              help_config ;;
+		key)                 help_key ;;
+		models)              help_models ;;
+		update|upgrade)      help_update ;;
+		exec)                help_exec ;;
+		test)                help_test ;;
+		backup)              help_backup ;;
+		reset)               help_reset ;;
+		version)             help_version ;;
+		help|-h|--help)      show_main_help ;;
+		*) err "no help topic: $topic (run 'llm-server help')" ;;
+	esac
+}
+
+# -------------------------------------------------------------- dispatch --
+# route `<cmd> -h|--help|help` to `help <cmd>`
+dispatch() {
+	local cmd="$1"; shift
+	if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
+		cmd_help "$cmd"
+		return
+	fi
+	"cmd_$cmd" "$@"
+}
+
+case "${1:-help}" in
+	up)                   shift; dispatch up "$@" ;;
+	down|stop)            shift; dispatch down "$@" ;;
+	restart)              shift; dispatch restart "$@" ;;
+	status|ps)            shift; dispatch status "$@" ;;
+	logs)                 shift; dispatch logs "$@" ;;
+	update|upgrade)       shift; dispatch update "$@" ;;
+	init)                 shift; dispatch init "$@" ;;
+	config)               shift; dispatch config "$@" ;;
+	key)                  shift; dispatch key "$@" ;;
+	models)               shift; dispatch models "$@" ;;
+	exec)                 shift; dispatch exec "$@" ;;
+	test)                 shift; dispatch test "$@" ;;
+	backup)               shift; dispatch backup "$@" ;;
+	reset)                shift; dispatch reset "$@" ;;
+	version|-v|--version) cmd_version ;;
+	help|-h|--help|"")    shift || true; cmd_help "$@" ;;
+	*) err "unknown command: $1 (run 'llm-server help')" ;;
+esac

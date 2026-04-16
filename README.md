@@ -1,31 +1,25 @@
 # llm-server
 
-Self-hosted LLM stack: **Ollama + Open WebUI + LiteLLM** behind **Caddy**.
-Same `docker compose` works on AWS, RunPod, or bare metal.
+Self-hosted LLM API stack: **Ollama** (GPU inference) + **LiteLLM** (OpenAI /
+Anthropic compatible proxy) + **Caddy** (TLS + routing).
+
+Single `docker compose` deployable on AWS, RunPod, or bare metal, managed via
+the `llm-server` CLI.
 
 ## Stack
 
 | Service | Container port | Role |
 |---|---|---|
 | ollama | 11434 | LLM inference (GPU) |
-| open-webui | 8080 | Chat UI |
 | litellm | 4000 | OpenAI / Anthropic compatible proxy |
-| caddy | 80 / 443 | Reverse proxy, TLS |
+| caddy | 80 / 443 | Reverse proxy, TLS, path routing |
 
-## Routing (via Caddy)
+## Routing (Caddy)
 
 ```
-/                      → open-webui
-/v1/*                  → litellm  (OpenAI format)
-/anthropic/*           → litellm  (Anthropic format; /anthropic stripped)
-/docs/, /ui/, /swagger → litellm  (Swagger, admin UI, assets)
+/                       → litellm   (OpenAI format, Swagger, Admin UI)
+/anthropic/*            → litellm   (Anthropic format; /anthropic stripped)
 ```
-
-## Prerequisites
-
-- Linux host with `apt-get`, `dnf`, or `yum` (Ubuntu / Debian / AL2023 / RHEL / Fedora)
-- For GPU: NVIDIA driver installed on host (`nvidia-smi` works)
-- Docker Engine + Compose plugin and NVIDIA Container Toolkit — **the one-line installer handles these automatically**
 
 ## One-line install
 
@@ -33,30 +27,59 @@ Same `docker compose` works on AWS, RunPod, or bare metal.
 curl -fsSL https://raw.githubusercontent.com/levx-me/llm-server/main/install.sh | bash
 ```
 
-Auto-detects RunPod vs AWS vs bare-metal, installs Docker + NVIDIA Container
-Toolkit as needed, clones this repo to `~/llm-server`, generates a random
-`LITELLM_MASTER_KEY`, and starts all containers. Override defaults via env:
+Auto-detects RunPod vs bare-metal, installs Docker + NVIDIA Container Toolkit
+as needed, clones this repo to `~/llm-server`, generates a random
+`LITELLM_MASTER_KEY`, and starts all containers.
 
+Override defaults via env:
 ```bash
-DATA_ROOT=/mnt/big-disk SITE_ADDRESS=llm.example.com \
+DATA_ROOT=/mnt/ssd SITE_ADDRESS=llm.example.com \
   curl -fsSL https://raw.githubusercontent.com/levx-me/llm-server/main/install.sh | bash
 ```
 
-## Quick start (manual)
+After install, manage via the `llm-server` CLI (symlinked to `/usr/local/bin`).
+
+## The `llm-server` CLI
+
+```
+llm-server up                     start the stack
+llm-server down                   stop the stack
+llm-server restart [service]      restart all or one service
+llm-server status                 container state + endpoints + master key
+llm-server logs [service]         tail logs
+llm-server update                 git pull + docker compose pull + up -d
+
+llm-server config [show|edit]     view / edit .env
+llm-server key [show|rotate]      show / rotate LITELLM_MASTER_KEY
+
+llm-server models [list]          list installed Ollama models
+llm-server models pull <name>     download a model
+llm-server models rm <name>       remove a model
+
+llm-server exec <svc> [cmd...]    run a command inside a container
+llm-server test                   curl /v1/models to verify
+llm-server backup [path]          tar.gz the DATA_ROOT
+llm-server reset                  down + delete DATA_ROOT (confirmation)
+
+llm-server version                CLI + image versions
+llm-server help [command]         detailed help
+```
+
+Detailed help for any command: `llm-server help <command>` or
+`llm-server <command> --help`.
+
+## Manual install
 
 ```bash
 git clone https://github.com/levx-me/llm-server.git
 cd llm-server
-cp .env.example .env
-# edit .env: LITELLM_MASTER_KEY, SITE_ADDRESS, MODELS, DATA_ROOT
-
-docker compose up -d
-docker compose logs -f model-init   # watch model downloads
+bin/llm-server init              # generates .env + data dirs
+bin/llm-server up
 ```
 
-## Platform notes
+## Platform profiles
 
-### AWS EC2 (or any bare metal with public IP + domain)
+### AWS EC2 / bare metal with a public domain
 
 ```env
 DATA_ROOT=./data
@@ -65,12 +88,11 @@ CADDY_HTTP_PORT=80
 CADDY_HTTPS_PORT=443
 ```
 
-- Point DNS `A` record at the EC2 public IP
+- Point DNS A record at the host IP
 - Open security group ports 80 + 443
-- Caddy auto-issues a Let's Encrypt cert (no manual TLS work)
-- Install `nvidia-container-toolkit` first: see https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+- Caddy auto-issues a Let's Encrypt cert
 
-### RunPod (GPU pod)
+### RunPod
 
 ```env
 DATA_ROOT=/runpod-volume
@@ -78,101 +100,74 @@ SITE_ADDRESS=:80
 CADDY_HTTP_PORT=80
 ```
 
-1. Create a **Network Volume** in RunPod (persists across pod rebuilds)
-2. Launch a GPU pod with the volume mounted at `/runpod-volume`
-3. In the pod template, expose HTTP port `80`
-4. SSH into the pod:
-   ```bash
-   git clone <this repo>
-   cd llm-server
-   cp .env.example .env   # edit as above
-   docker compose up -d
-   ```
-5. Access at `https://{pod-id}-80.proxy.runpod.net` (RunPod terminates TLS)
+1. Create a Network Volume (persists models / certs)
+2. Launch a GPU pod, mount the volume at `/runpod-volume`
+3. Expose HTTP port `80` in the pod template
+4. SSH in and run the one-liner above
+5. Access at `https://{pod-id}-80.proxy.runpod.net`
 
-> RunPod proxy handles HTTPS — Caddy only needs to serve plain HTTP. Set
-> `SITE_ADDRESS=:80`. If you want your own domain with TCP public IP instead
-> of the proxy, use `SITE_ADDRESS=llm.example.com` like the AWS case.
+RunPod proxy terminates TLS for you, so `SITE_ADDRESS=:80` is correct.
 
-## Configuration
+## API usage
 
-- **Models** — edit `configs/litellm-config.yaml` to add / alias models
-- **Routing** — edit `configs/Caddyfile`
-- **Pre-pulled models** — set `MODELS="gemma4:e4b qwen3.5:9b ..."` in `.env`
-
-Restart after config changes:
-
-```bash
-docker compose restart litellm    # after litellm-config.yaml change
-docker compose restart caddy      # after Caddyfile change
-```
-
-## Usage
-
-**OpenAI SDK:**
+**OpenAI SDK**
 ```python
 from openai import OpenAI
 client = OpenAI(
-    base_url="https://your-domain/v1",
+    base_url="https://your-host/v1",
     api_key="<LITELLM_MASTER_KEY>",
 )
 client.chat.completions.create(model="gemma4", messages=[...])
 ```
 
-**Anthropic / Claude Code:**
+**Anthropic / Claude Code**
 ```bash
-export ANTHROPIC_BASE_URL="https://your-domain"
+export ANTHROPIC_BASE_URL="https://your-host"
 export ANTHROPIC_AUTH_TOKEN="<LITELLM_MASTER_KEY>"
 export ANTHROPIC_MODEL="claude-opus-4-5"
 export ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-4-5"
 ```
 
-## Operations
+All `claude-*` model names are aliased to `gemma4:e4b` in
+`configs/litellm-config.yaml`. Add / modify mappings there and restart
+LiteLLM: `llm-server restart litellm`.
 
-```bash
-docker compose ps
-docker compose logs -f <service>
-docker compose restart <service>
-docker compose down        # stop all
-docker compose down -v     # stop + drop named volumes (DATA_ROOT bind mounts stay)
-```
+## Certificate management
 
-### Update
+Caddy handles Let's Encrypt automatically when `SITE_ADDRESS` is a domain.
+Things to keep in mind:
 
-Pull the latest config + images:
+- **Keep port 80 open** — ACME HTTP-01 challenge uses it even for HTTPS-only
+  sites. If 80 is closed, renewals fail.
+- **Preserve `DATA_ROOT`** — certs and ACME account key live in
+  `$DATA_ROOT/caddy/data`. Wiping it triggers re-issuance and can hit
+  Let's Encrypt rate limits on repeated cycles.
+- **DNS must point at the host** — Caddy fails if the record is stale.
+- **Auto-renewal** runs ~30 days before expiry. No cron needed.
 
-```bash
-cd ~/llm-server
-git pull --ff-only
-docker compose pull
-docker compose up -d
-```
+## Data layout
 
-Or re-run the one-liner — idempotent, it git-pulls and restarts.
-
-### Pull additional models
-
-```bash
-docker compose exec ollama ollama pull qwen3.5:27b
-# or add to MODELS in .env and: docker compose run --rm model-init
-```
-
-### Reset
-
-```bash
-docker compose down
-rm -rf "$DATA_ROOT"       # wipes all models + chat history + TLS certs
-```
-
-## Data layout (under `DATA_ROOT`)
+Everything persistent lives under `${DATA_ROOT}`:
 
 ```
 ${DATA_ROOT}/
-├── ollama/        # pulled models (GB)
-├── openwebui/     # Open WebUI users, chats, uploads
+├── ollama/         # pulled models (GB)
 └── caddy/
-    ├── data/      # Let's Encrypt certs, state
-    └── config/    # runtime config
+    ├── data/       # Let's Encrypt certs, account key, runtime state
+    └── config/     # runtime config
 ```
 
-Back up the whole `DATA_ROOT` to preserve everything.
+Back up the whole `DATA_ROOT` to preserve everything:
+
+```bash
+llm-server backup /mnt/backups/llm.tar.gz
+```
+
+## Security notes
+
+- Admin UI (`/ui/`) and Swagger (`/docs/`) are exposed — access is gated by
+  `LITELLM_MASTER_KEY` but still leak the spec. Restrict at the proxy layer
+  if that matters (e.g. IP allowlist in Caddy).
+- Rotate the key periodically: `llm-server key rotate`.
+- The master key grants full API access; distribute LiteLLM *virtual keys*
+  (via Admin UI) to end users instead.

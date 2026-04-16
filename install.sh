@@ -5,12 +5,12 @@
 #   curl -fsSL https://raw.githubusercontent.com/levx-me/llm-server/main/install.sh | bash
 #
 # Overridable env vars:
-#   REPO          GitHub slug (default levx-me/llm-server)
-#   BRANCH        Git branch (default main)
-#   TARGET        Install directory (default $HOME/llm-server)
-#   DATA_ROOT     Persistent data path (auto-detected)
-#   SITE_ADDRESS  Caddy site address (default :80)
-#   SKIP_LAUNCH   Set to 1 to skip `docker compose up`
+#   REPO           GitHub slug (default levx-me/llm-server)
+#   BRANCH         Git branch (default main)
+#   TARGET         Install directory (default $HOME/llm-server)
+#   DATA_ROOT      Persistent data path (auto-detected)
+#   SITE_ADDRESS   Caddy site address (default :80)
+#   SKIP_LAUNCH    Set to 1 to skip `llm-server up`
 
 set -euo pipefail
 
@@ -28,7 +28,7 @@ else
 	SUDO="sudo"
 fi
 
-# ---------------------------------------------------------------- distro --
+# ------------------------------------------------------------- distro --
 . /etc/os-release 2>/dev/null || err "cannot read /etc/os-release"
 
 if command -v apt-get >/dev/null; then
@@ -48,26 +48,19 @@ else
 fi
 log "distro: ${PRETTY_NAME:-$ID} ($PKG)"
 
-# ---------------------------------------------------------------- platform --
-PLATFORM="bare-metal"
-AUTO_DATA_ROOT="$TARGET/data"
-AUTO_SITE_ADDRESS=":80"
-
-if [[ -d /runpod-volume ]] || [[ -n "${RUNPOD_POD_ID:-}" ]]; then
-	PLATFORM="runpod"
-	AUTO_DATA_ROOT="/runpod-volume"
-elif [[ -d /workspace ]] && [[ -n "${RUNPOD_POD_ID:-}" ]]; then
-	PLATFORM="runpod"
-	AUTO_DATA_ROOT="/workspace"
-elif curl -fsS --max-time 1 -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
-	-X PUT http://169.254.169.254/latest/api/token >/dev/null 2>&1; then
-	PLATFORM="aws"
-elif curl -fsS --max-time 1 http://169.254.169.254/latest/meta-data/ >/dev/null 2>&1; then
-	PLATFORM="aws"
+# ----------------------------------------------------------- platform --
+if [[ -z "${DATA_ROOT:-}" ]]; then
+	if [[ -d /runpod-volume ]] || [[ -n "${RUNPOD_POD_ID:-}" ]]; then
+		export DATA_ROOT="/runpod-volume"
+		log "platform: runpod"
+	else
+		export DATA_ROOT="$TARGET/data"
+		log "platform: generic"
+	fi
 fi
-log "platform: $PLATFORM"
+export SITE_ADDRESS="${SITE_ADDRESS:-:80}"
 
-# ---------------------------------------------------------------- packages --
+# ----------------------------------------------------------- packages --
 if ! command -v git >/dev/null || ! command -v curl >/dev/null; then
 	log "installing base packages"
 	pkg_update
@@ -78,16 +71,13 @@ if ! command -v docker >/dev/null; then
 	log "installing Docker Engine"
 	curl -fsSL https://get.docker.com | $SUDO sh
 	$SUDO systemctl enable --now docker 2>/dev/null || $SUDO service docker start || true
-	if [[ -n "$SUDO" ]]; then
-		$SUDO usermod -aG docker "$(id -un)" || true
-	fi
+	[[ -n "$SUDO" ]] && $SUDO usermod -aG docker "$(id -un)" || true
 fi
 
-if ! docker compose version >/dev/null 2>&1 && ! $SUDO docker compose version >/dev/null 2>&1; then
+$SUDO docker compose version >/dev/null 2>&1 ||
 	err "Docker Compose v2 plugin missing. Update Docker Engine."
-fi
 
-# -------------------------------------------------------------------- GPU --
+# ---------------------------------------------------------------- GPU --
 if command -v nvidia-smi >/dev/null 2>&1; then
 	log "NVIDIA GPU detected: $(nvidia-smi -L | head -1 | cut -c1-70)"
 	if ! $SUDO docker info 2>/dev/null | grep -qi 'Runtimes:.*nvidia'; then
@@ -112,10 +102,10 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 		$SUDO systemctl restart docker 2>/dev/null || $SUDO service docker restart || true
 	fi
 else
-	log "no NVIDIA GPU detected — containers will run on CPU (slow)"
+	log "no NVIDIA GPU — containers will run on CPU (slow)"
 fi
 
-# -------------------------------------------------------------------- clone --
+# -------------------------------------------------------------- clone --
 if [[ -d "$TARGET/.git" ]]; then
 	log "updating $TARGET"
 	git -C "$TARGET" fetch --quiet origin "$BRANCH"
@@ -128,73 +118,28 @@ else
 	git clone --quiet --branch "$BRANCH" "https://github.com/$REPO.git" "$TARGET"
 fi
 
-cd "$TARGET"
+# ------------------------------------------------------------ CLI link --
+log "installing llm-server CLI"
+chmod +x "$TARGET/bin/llm-server"
+$SUDO ln -sf "$TARGET/bin/llm-server" /usr/local/bin/llm-server
 
-# ---------------------------------------------------------------------- .env --
-if [[ ! -f .env ]]; then
-	log "generating .env"
-	[[ -f .env.example ]] || err ".env.example missing in repo"
-	cp .env.example .env
+# ---------------------------------------------------- init + launch --
+export LLM_HOME="$TARGET"
+/usr/local/bin/llm-server init
 
-	if command -v python3 >/dev/null; then
-		KEY="sk-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-	else
-		KEY="sk-$(openssl rand -base64 32 | tr -d '=+/' | cut -c1-43)"
-	fi
-	sed -i "s|sk-CHANGE-ME|$KEY|" .env
-
-	DATA_ROOT_VAL="${DATA_ROOT:-$AUTO_DATA_ROOT}"
-	sed -i "s|^DATA_ROOT=.*|DATA_ROOT=$DATA_ROOT_VAL|" .env
-
-	SITE_ADDRESS_VAL="${SITE_ADDRESS:-$AUTO_SITE_ADDRESS}"
-	sed -i "s|^SITE_ADDRESS=.*|SITE_ADDRESS=$SITE_ADDRESS_VAL|" .env
-else
-	log ".env already exists — leaving untouched"
-fi
-
-DATA_ROOT_VAL=$(grep '^DATA_ROOT=' .env | cut -d= -f2-)
-$SUDO mkdir -p "$DATA_ROOT_VAL"/{ollama,openwebui,caddy/data,caddy/config} 2>/dev/null || true
-$SUDO chown -R "$(id -u):$(id -g)" "$DATA_ROOT_VAL" 2>/dev/null || true
-
-# ------------------------------------------------------------------ launch --
-if [[ "${SKIP_LAUNCH:-0}" == "1" ]]; then
-	log "SKIP_LAUNCH=1 — skipping docker compose up"
-else
-	log "pulling images (this may take a few minutes)"
-	$SUDO docker compose pull --quiet
-	log "starting containers"
-	$SUDO docker compose up -d
-fi
-
-# ------------------------------------------------------------ verification --
 if [[ "${SKIP_LAUNCH:-0}" != "1" ]]; then
-	log "verifying stack"
-	PORT=$(grep '^CADDY_HTTP_PORT=' .env | cut -d= -f2- || echo 80)
-	PORT=${PORT:-80}
-	for i in {1..30}; do
-		if curl -fsS -o /dev/null --max-time 2 "http://localhost:${PORT}/" 2>/dev/null; then
-			log "Caddy responding on :${PORT}"
-			break
-		fi
-		sleep 2
-	done
+	/usr/local/bin/llm-server up
+	sleep 3
+	/usr/local/bin/llm-server status
 fi
 
-# ------------------------------------------------------------------ summary --
+# ------------------------------------------------------------- finish --
 echo
-log "done."
-echo
-echo "Install directory: $TARGET"
-echo "Platform:          $PLATFORM"
-echo "Distro:            $PKG"
-grep -E '^(LITELLM_MASTER_KEY|SITE_ADDRESS|DATA_ROOT|MODELS|CADDY_HTTP_PORT)=' .env | sed 's/^/  /'
-echo
-echo "Next steps:"
-echo "  cd $TARGET"
-echo "  docker compose ps"
-echo "  docker compose logs -f model-init   # watch model download"
+log "installation complete"
+echo "  CLI:   llm-server help"
+echo "  Home:  $TARGET"
 echo
 if [[ -n "$SUDO" ]] && ! groups | grep -q '\bdocker\b'; then
-	echo "NOTE: you were just added to the 'docker' group."
-	echo "      log out and back in to run docker without sudo."
+	echo "NOTE: you were added to the 'docker' group."
+	echo "      log out and back in so docker works without sudo."
 fi
