@@ -1,3 +1,6 @@
 .env
+/data/
 *.local
+*.log
 .DS_Store
+backup-*.tar.gz

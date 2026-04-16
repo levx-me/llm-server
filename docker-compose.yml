@@ -75,3 +75,17 @@ services:
       - ${DATA_ROOT:-./data}/caddy/config:/config
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+
+  # Public tunnel via ngrok — optional.
+  # Enable by setting NGROK_AUTHTOKEN + NGROK_DOMAIN in .env and
+  # COMPOSE_PROFILES=ngrok (or pass `--profile ngrok` to docker compose).
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: ngrok
+    restart: unless-stopped
+    profiles: [ngrok]
+    depends_on:
+      - caddy
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    command: http --url=${NGROK_DOMAIN} caddy:80

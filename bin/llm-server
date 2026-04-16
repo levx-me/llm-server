@@ -58,7 +58,11 @@ env_get() {
 
 env_set() {
 	require_home
-	sed -i "s|^$1=.*|$1=$2|" "$LLM_HOME/.env"
+	if grep -q "^$1=" "$LLM_HOME/.env"; then
+		sed -i "s|^$1=.*|$1=$2|" "$LLM_HOME/.env"
+	else
+		echo "$1=$2" >>"$LLM_HOME/.env"
+	fi
 }
 
 gen_key() {
@@ -116,22 +120,29 @@ cmd_status() {
 	dc ps
 	echo
 
-	local site port
+	local site port ngrok_domain base
 	site="$(env_get SITE_ADDRESS || echo ':80')"
 	port="$(env_get CADDY_HTTP_PORT || echo '80')"
+	ngrok_domain="$(env_get NGROK_DOMAIN || true)"
 
 	echo "Endpoints:"
 	if [[ "$site" == :* ]]; then
-		echo "  http://<host>:${port}/v1/models          (OpenAI)"
-		echo "  http://<host>:${port}/anthropic/v1/messages (Anthropic)"
-		echo "  http://<host>:${port}/docs/                (Swagger)"
-		echo "  http://<host>:${port}/ui/                  (Admin UI)"
+		base="http://<host>:${port}"
 	else
-		echo "  https://${site}/v1/models"
-		echo "  https://${site}/anthropic/v1/messages"
-		echo "  https://${site}/docs/"
-		echo "  https://${site}/ui/"
+		base="https://${site}"
 	fi
+	echo "  ${base}/v1/models                (OpenAI)"
+	echo "  ${base}/anthropic/v1/messages    (Anthropic)"
+	echo "  ${base}/docs/                    (Swagger)"
+	echo "  ${base}/ui/                      (Admin UI)"
+
+	if [[ -n "$ngrok_domain" ]] && dc ps --services --filter status=running 2>/dev/null | grep -qx ngrok; then
+		echo
+		echo "Public (ngrok):"
+		echo "  https://${ngrok_domain}/v1/models"
+		echo "  https://${ngrok_domain}/anthropic/v1/messages"
+	fi
+
 	echo
 	echo "Master key: $(env_get LITELLM_MASTER_KEY)"
 }
@@ -246,6 +257,54 @@ cmd_backup() {
 	log "created: $target ($(du -h "$target" | cut -f1))"
 }
 
+cmd_ngrok() {
+	local action="${1:-status}"
+
+	case "$action" in
+		enable)
+			local token="${2:-}" domain="${3:-}"
+			if [[ -z "$token" || -z "$domain" ]]; then
+				token="$(env_get NGROK_AUTHTOKEN || true)"
+				domain="$(env_get NGROK_DOMAIN || true)"
+				if [[ -z "$token" || -z "$domain" ]]; then
+					err "usage: llm-server ngrok enable <authtoken> <domain>"
+				fi
+			fi
+			env_set NGROK_AUTHTOKEN "$token"
+			env_set NGROK_DOMAIN "$domain"
+			env_set COMPOSE_PROFILES "ngrok"
+			dc up -d
+			log "ngrok enabled: https://${domain}"
+			;;
+		disable)
+			env_set COMPOSE_PROFILES ""
+			dc stop ngrok 2>/dev/null || true
+			dc rm -f ngrok 2>/dev/null || true
+			log "ngrok disabled (token/domain kept in .env)"
+			;;
+		status|"")
+			local profile token domain
+			profile="$(env_get COMPOSE_PROFILES 2>/dev/null || true)"
+			token="$(env_get NGROK_AUTHTOKEN 2>/dev/null || true)"
+			domain="$(env_get NGROK_DOMAIN 2>/dev/null || true)"
+			if [[ "$profile" == *ngrok* ]]; then
+				echo "ngrok: ENABLED"
+				[[ -n "$domain" ]] && echo "  public: https://${domain}"
+				dc ps ngrok 2>/dev/null | tail -n +2 | sed 's/^/  /'
+			else
+				echo "ngrok: disabled"
+				[[ -n "$token"  ]] && echo "  authtoken: (set)" || echo "  authtoken: (unset)"
+				[[ -n "$domain" ]] && echo "  domain:    $domain" || echo "  domain:    (unset)"
+				echo
+				echo "Enable with: llm-server ngrok enable <token> <domain>"
+			fi
+			;;
+		*)
+			err "usage: llm-server ngrok [enable <token> <domain>|disable|status]"
+			;;
+	esac
+}
+
 cmd_reset() {
 	require_home
 	local data_root
@@ -307,6 +366,9 @@ OPERATIONS
   update                git pull + docker compose pull + up -d
   exec <svc> [cmd...]   run a command inside a container (default: sh)
   test                  hit /v1/models to verify the API end-to-end
+  ngrok [status]        show ngrok tunnel state
+  ngrok enable <t> <d>  enable public tunnel (authtoken, domain)
+  ngrok disable         disable public tunnel
   backup [path]         create a tar.gz of DATA_ROOT
   reset                 stop and delete DATA_ROOT (confirmation required)
 
@@ -506,6 +568,33 @@ USAGE
 EOF
 }
 
+help_ngrok() { cat <<'EOF'
+llm-server ngrok — manage optional public tunnel
+
+Starts an ngrok container that exposes the stack publicly, for hosts
+that can't do port forwarding (behind NAT, corporate network, etc).
+
+USAGE
+  llm-server ngrok                        show current state
+  llm-server ngrok status                 same
+  llm-server ngrok enable <token> <domain>  turn on; restart stack
+  llm-server ngrok disable                 turn off and stop container
+
+PREREQUISITES
+  - Free ngrok account: https://dashboard.ngrok.com
+  - Reserved static domain (free tier gives one):
+    https://dashboard.ngrok.com/domains
+
+EXAMPLES
+  llm-server ngrok enable <authtoken> myname.ngrok-free.dev
+  llm-server ngrok status
+  llm-server ngrok disable
+
+  # Re-enable with previously saved token/domain:
+  llm-server ngrok enable
+EOF
+}
+
 help_reset() { cat <<'EOF'
 llm-server reset — wipe everything (DESTRUCTIVE)
 
@@ -549,6 +638,7 @@ cmd_help() {
 		exec)                help_exec ;;
 		test)                help_test ;;
 		backup)              help_backup ;;
+		ngrok)               help_ngrok ;;
 		reset)               help_reset ;;
 		version)             help_version ;;
 		help|-h|--help)      show_main_help ;;
@@ -581,6 +671,7 @@ case "${1:-help}" in
 	exec)                 shift; dispatch exec "$@" ;;
 	test)                 shift; dispatch test "$@" ;;
 	backup)               shift; dispatch backup "$@" ;;
+	ngrok)                shift; dispatch ngrok "$@" ;;
 	reset)                shift; dispatch reset "$@" ;;
 	version|-v|--version) cmd_version ;;
 	help|-h|--help|"")    shift || true; cmd_help "$@" ;;

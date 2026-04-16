@@ -100,6 +100,25 @@ SITE_ADDRESS=:80
 CADDY_HTTP_PORT=80
 ```
 
+### Behind NAT / no port forwarding (ngrok tunnel)
+
+When the host can't expose ports publicly, add an ngrok tunnel as an
+optional Docker service:
+
+1. Get an authtoken: https://dashboard.ngrok.com/get-started/your-authtoken
+2. Reserve a free static domain: https://dashboard.ngrok.com/domains
+3. Append to `.env`:
+   ```env
+   NGROK_AUTHTOKEN=<your-authtoken>
+   NGROK_DOMAIN=<your-name>.ngrok-free.dev
+   COMPOSE_PROFILES=ngrok
+   ```
+4. Apply: `llm-server ngrok enable <token> <domain>`
+   (or edit `.env` directly and run `llm-server up`)
+
+The ngrok container tunnels `caddy:80` (internal) through your reserved
+domain. Without the `ngrok` profile the service is not created.
+
 1. Create a Network Volume (persists models / certs)
 2. Launch a GPU pod, mount the volume at `/runpod-volume`
 3. Expose HTTP port `80` in the pod template
