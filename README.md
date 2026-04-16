@@ -27,9 +27,26 @@ Same `docker compose` works on AWS, RunPod, or bare metal.
 - NVIDIA Container Toolkit for GPU
 - NVIDIA driver on host
 
-## Quick start
+## One-line install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/levx-me/llm-server/main/install.sh | bash
+```
+
+Auto-detects RunPod vs AWS vs bare-metal, installs Docker + NVIDIA Container
+Toolkit as needed, clones this repo to `~/llm-server`, generates a random
+`LITELLM_MASTER_KEY`, and starts all containers. Override defaults via env:
+
+```bash
+DATA_ROOT=/mnt/big-disk SITE_ADDRESS=llm.example.com \
+  curl -fsSL https://raw.githubusercontent.com/levx-me/llm-server/main/install.sh | bash
+```
+
+## Quick start (manual)
+
+```bash
+git clone https://github.com/levx-me/llm-server.git
+cd llm-server
 cp .env.example .env
 # edit .env: LITELLM_MASTER_KEY, SITE_ADDRESS, MODELS, DATA_ROOT
 
