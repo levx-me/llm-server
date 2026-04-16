@@ -23,9 +23,9 @@ Same `docker compose` works on AWS, RunPod, or bare metal.
 
 ## Prerequisites
 
-- Docker + Docker Compose
-- NVIDIA Container Toolkit for GPU
-- NVIDIA driver on host
+- Linux host with `apt-get`, `dnf`, or `yum` (Ubuntu / Debian / AL2023 / RHEL / Fedora)
+- For GPU: NVIDIA driver installed on host (`nvidia-smi` works)
+- Docker Engine + Compose plugin and NVIDIA Container Toolkit — **the one-line installer handles these automatically**
 
 ## One-line install
 
@@ -135,6 +135,33 @@ docker compose logs -f <service>
 docker compose restart <service>
 docker compose down        # stop all
 docker compose down -v     # stop + drop named volumes (DATA_ROOT bind mounts stay)
+```
+
+### Update
+
+Pull the latest config + images:
+
+```bash
+cd ~/llm-server
+git pull --ff-only
+docker compose pull
+docker compose up -d
+```
+
+Or re-run the one-liner — idempotent, it git-pulls and restarts.
+
+### Pull additional models
+
+```bash
+docker compose exec ollama ollama pull qwen3.5:27b
+# or add to MODELS in .env and: docker compose run --rm model-init
+```
+
+### Reset
+
+```bash
+docker compose down
+rm -rf "$DATA_ROOT"       # wipes all models + chat history + TLS certs
 ```
 
 ## Data layout (under `DATA_ROOT`)
